@@ -1,6 +1,6 @@
 # Releasing TMPlayer
 
-Releases are cut by pushing a tag. Nothing else produces a signed APK or a desktop installer.
+Published releases are cut by pushing a tag. A signed Android APK can also be built locally using the existing release keystore.
 Every release goes out first as a test version, a GitHub pre-release tagged `vX.Y.Z-beta.N` from
 `main`; it is installed and tried on the real devices, and the release `vX.Y.Z` follows from the
 same commit or one with the fixes (see [Test versions](#test-versions-pre-releases) below):
@@ -259,3 +259,18 @@ environment, the desktop ones included, asks for approval separately.
 Anyone building a fork should register their own `api_id` and `api_hash` and put them in
 `local.properties`. The reasoning, and what the build does without them, is in
 [BUILDING.md](BUILDING.md).
+
+## Local Windows APK builds
+
+Keep `keystore.properties` and the release keystore private and never commit them. The existing
+root-level properties file configures local Gradle release signing; GitHub Actions continues to
+create its own properties file from repository secrets. With the Android SDK and Java installed, run:
+
+```powershell
+.\scripts\build-local-release.ps1
+```
+
+The script builds `:app:assembleRelease`, checks the package and compares the APK certificate with
+the configured keystore, then copies the APK and a SHA-256 file to `Veylora-Builds` in your user
+directory. Independently check the downloaded file with `Get-FileHash -Algorithm SHA256 <apk>` and
+compare it to the adjacent `.sha256` file. Never share the keystore, passwords, or properties file.

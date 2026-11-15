@@ -63,6 +63,7 @@ fun MetaExtras.withProviderScore(provider: MetaProvider): MetaExtras {
         MetaProvider.Tmdb -> MetaScore(ScoreSource.Tmdb, rating)
         MetaProvider.TvMaze -> MetaScore(ScoreSource.TvMaze, rating)
         MetaProvider.AniList -> MetaScore(ScoreSource.AniList, kotlin.math.round(rating * 10))
+        MetaProvider.Omdb -> MetaScore(ScoreSource.Imdb, rating)
     }
     if (scores.any { it.source == score.source }) return this
     return copy(scores = MetaScore.merge(scores, listOf(score)))

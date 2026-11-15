@@ -47,12 +47,14 @@ class OnlineMetadataTest {
         key: String = "build-key",
         lang: String = "en",
         enabled: Boolean = true,
+        omdbKey: String = "",
         cache: MetadataCache = MetadataCache(File(dir, "cache"), now = { clock }),
     ): OnlineMetadata {
         val store = MetadataStore(File(dir, "metadata.properties"))
         store.update { it.copy(enabled = enabled) }
         return OnlineMetadata(
             buildKey = key,
+            omdbKey = omdbKey,
             store = store,
             cache = cache,
             appVersion = "test",
@@ -135,10 +137,8 @@ class OnlineMetadataTest {
 
     @Test
     fun withoutAKeyShowsComeFromTvMazeWithTheirEpisodes() = runBlocking {
-        http.on("singlesearch/shows") {
-            """{"id":169,"name":"Harbour Notes","premiered":"2021-03-01","summary":"<p><b>Harbour Notes</b> is set by the sea.</p>",
-            "image":{"medium":"https://static.tvmaze.com/hn.jpg"}}"""
-        }
+        http.on("search/shows") { """[{"show":{"id":169,"name":"Harbour Notes","premiered":"2021-03-01","summary":"<p><b>Harbour Notes</b> is set by the sea.</p>",
+            "image":{"medium":"https://static.tvmaze.com/hn.jpg"}}}]""" }
         http.on("shows/169/episodebynumber?season=1&number=2") {
             """{"name":"Low Tide","summary":"<p>The boats stay in.</p>","image":{"medium":"https://static.tvmaze.com/e.jpg"}}"""
         }
@@ -150,6 +150,39 @@ class OnlineMetadataTest {
         assertEquals("Low Tide", info.episode?.name)
         assertEquals("The boats stay in.", info.episode?.overview)
         assertEquals(0, http.count("themoviedb"))
+    }
+
+    @Test
+    fun tvmazeChoosesTheMatchingTitleInsteadOfTheFirstResult() = runBlocking {
+        http.on("search/shows") {
+            """[{"show":{"id":1,"name":"Harbour Stories","premiered":"2021-01-01"}},
+                {"show":{"id":2,"name":"Harbour Notes","premiered":"2021-01-01"}}]"""
+        }
+        val info = (metadata().lookup(query("Harbour Notes 2023 S02E01.mkv").showOnly()) as MetaResult.Found).info
+        assertEquals(MetaProvider.TvMaze, info.provider)
+        assertEquals("2", info.id)
+        assertEquals(0, http.count("search/tv"))
+    }
+
+    @Test
+    fun tvmazeEpisodeFallsBackToIndependentlyResolvedTmdbShow() = runBlocking {
+        http.on("search/shows") { """[{"show":{"id":169,"name":"Harbour Notes","premiered":"2021-03-01"}}]""" }
+        http.on("search/tv") { harbourSearch }
+        http.on("tv/555/season/1/episode/2") { harbourEpisode }
+        val info = (metadata().lookup(query("Harbour Notes S01E02.mkv")) as MetaResult.Found).info
+        assertEquals(MetaProvider.TvMaze, info.provider)
+        assertEquals("169", info.id)
+        assertEquals("The Storm", info.episode?.name)
+    }
+
+    @Test
+    fun omdbSuppliesAMovieWhenTmdbHasNoMatch() = runBlocking {
+        http.on("search/movie") { """{"results":[]}""" }
+        http.on("omdbapi.com") { """{"Response":"True","Type":"movie","Title":"Big Buck Bunny","Year":"2008","imdbID":"tt1234567","Plot":"A rabbit.","Poster":"https://example.com/p.jpg"}""" }
+        val info = (metadata(omdbKey = "test").lookup(query("Big Buck Bunny (2008).mkv")) as MetaResult.Found).info
+        assertEquals(MetaProvider.Omdb, info.provider)
+        assertEquals("tt1234567", info.id)
+        assertEquals("A rabbit.", info.overview)
     }
 
     @Test
@@ -209,9 +242,7 @@ class OnlineMetadataTest {
 
     @Test
     fun aSecondSeasonEpisodeFindsItsShowOnTvMazeToo() = runBlocking {
-        http.on("singlesearch/shows") {
-            """{"id":44,"name":"Loki","premiered":"2021-06-09","summary":"<p>The god of mischief.</p>","image":{"medium":"https://static.tvmaze.com/l.jpg"}}"""
-        }
+        http.on("search/shows") { """[{"show":{"id":44,"name":"Loki","premiered":"2021-06-09","summary":"<p>The god of mischief.</p>","image":{"medium":"https://static.tvmaze.com/l.jpg"}}}]""" }
         val info = (metadata(key = "").lookup(query(lokiSeries().cover.fileName).showOnly()) as? MetaResult.Found)?.info
         assertEquals("https://static.tvmaze.com/l.jpg", info?.posterUrl)
     }
@@ -290,7 +321,7 @@ class OnlineMetadataTest {
     @Test
     fun aRefusedKeyTurnsTmdbOffButShowsStillComeFromTvMaze() = runBlocking {
         http.on("themoviedb", code = 401) { """{"status_code":7,"status_message":"Invalid API key"}""" }
-        http.on("singlesearch/shows") { """{"id":9,"name":"Harbour Notes","premiered":"2021-01-01","summary":"By the sea."}""" }
+        http.on("search/shows") { """[{"show":{"id":9,"name":"Harbour Notes","premiered":"2021-01-01","summary":"By the sea."}}]""" }
         val online = metadata()
         assertEquals(MetaResult.Unavailable, online.lookup(query("Big.Buck.Bunny.2008.mkv")))
         assertEquals(TmdbState.AppKeyRefused, online.tmdbState())
@@ -515,8 +546,8 @@ class OnlineMetadataTest {
     @Test
     fun aMissKeptBeforeTheEnglishSearchIsAskedAgain() {
         val q = query("Amelie.2001.mkv")
-        assertEquals("Film|amelie|2001||||en-US", q.cacheKey("en-US"))
-        assertEquals("Film|amelie|2001||||ar+en", q.cacheKey("ar"))
+        assertEquals("Film-v2|amelie|2001||||en-US", q.cacheKey("en-US"))
+        assertEquals("Film-v2|amelie|2001||||ar+en", q.cacheKey("ar"))
     }
 
     @Test
@@ -524,9 +555,9 @@ class OnlineMetadataTest {
         val tamil = MetaQuery(title = "Idiot", year = 2022, languages = listOf("ta"))
         val hindi = tamil.copy(languages = listOf("hi"))
         val none = tamil.copy(languages = emptyList())
-        assertEquals("Film|idiot|2022||||en-US|ta", tamil.cacheKey("en-US"))
-        assertEquals("Film|idiot|2022||||ar+en|hi", hindi.cacheKey("ar"))
-        assertEquals("Film|idiot|2022||||en-US", none.cacheKey("en-US"))
+        assertEquals("Film-v2|idiot|2022||||en-US|ta", tamil.cacheKey("en-US"))
+        assertEquals("Film-v2|idiot|2022||||ar+en|hi", hindi.cacheKey("ar"))
+        assertEquals("Film-v2|idiot|2022||||en-US", none.cacheKey("en-US"))
         assertNotEquals(tamil.cacheKey("en-US"), hindi.cacheKey("en-US"))
     }
 
@@ -534,7 +565,7 @@ class OnlineMetadataTest {
     fun audioLanguagesInAnyOrderShareOneKey() {
         val a = MetaQuery(title = "Idiot", year = 2022, languages = listOf("ta", "hi"))
         val b = a.copy(languages = listOf("hi", "ta"))
-        assertEquals("Film|idiot|2022||||en-US|hi-ta", a.cacheKey("en-US"))
+        assertEquals("Film-v2|idiot|2022||||en-US|hi-ta", a.cacheKey("en-US"))
         assertEquals(a.cacheKey("en-US"), b.cacheKey("en-US"))
     }
 

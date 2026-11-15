@@ -340,26 +340,30 @@ class TvMazeApi(
     private val limiter: RateLimiter,
     private val userAgent: String,
 ) {
-    /** The best match TVmaze has for [name], or Ok(null) when it has none (a 404). */
-    suspend fun show(name: String): MetaReply<MetaCandidate?> {
+    /** Search candidates; selection belongs to the shared confidence rules. */
+    suspend fun search(name: String): MetaReply<List<MetaCandidate>> {
         limiter.acquire()
-        val request = HttpRequest("GET", "$BASE/singlesearch/shows?q=${enc(name)}", headers())
+        val request = HttpRequest("GET", "$BASE/search/shows?q=${enc(name)}", headers())
         val response = try {
             http.send(request)
         } catch (e: IOException) {
             return MetaReply.Failed(0)
         }
-        if (response.code == 404) return MetaReply.Ok(null)
-        return sort(response, DEFAULT_WAIT_MS) { json ->
-            MetaCandidate(
-                id = json.get("id").toString(),
-                names = listOf(json.optString("name")),
-                year = yearOf(json.optString("premiered")),
-                overview = metaPlain(json.optString("summary")),
-                posterUrl = json.optJSONObject("image")?.optString("medium")?.ifBlank { null },
-                backdropUrl = null,
-            )
-        }
+        if (response.code == 404) return MetaReply.Ok(emptyList())
+        if (response.code !in 200..299) return sort(response, DEFAULT_WAIT_MS) { emptyList() }
+        return runCatching {
+            MetaReply.Ok(objects(JSONArray(response.text)).mapNotNull { result ->
+                val show = result.optJSONObject("show") ?: return@mapNotNull null
+                MetaCandidate(
+                    id = show.get("id").toString(),
+                    names = listOf(show.optString("name")),
+                    year = yearOf(show.optString("premiered")),
+                    overview = metaPlain(show.optString("summary")),
+                    posterUrl = show.optJSONObject("image")?.optString("medium")?.ifBlank { null },
+                    backdropUrl = null,
+                )
+            })
+        }.getOrElse { MetaReply.Failed(response.code) }
     }
 
     suspend fun episode(showId: String, season: Int, number: Int): MetaReply<MetaEpisode?> {
@@ -478,6 +482,27 @@ class OmdbApi(
     private val limiter: RateLimiter,
     private val userAgent: String,
 ) {
+    /** One title answer, validated by the caller against the filename. */
+    suspend fun title(key: String, title: String, series: Boolean): MetaReply<MetaCandidate?> {
+        limiter.acquire()
+        val type = if (series) "series" else "movie"
+        val request = HttpRequest("GET", "$BASE/?t=${enc(title)}&type=$type&plot=full&apikey=${enc(key)}", mapOf("Accept" to "application/json", "User-Agent" to userAgent))
+        val response = try { http.send(request) } catch (e: IOException) { return MetaReply.Failed(0) }
+        val json = runCatching { JSONObject(response.text) }.getOrNull() ?: return MetaReply.Failed(response.code)
+        if (json.optString("Response").equals("False", true)) {
+            return when (val status = read(json)) {
+                is MetaReply.Throttled -> MetaReply.Throttled(status.retryAfterMs)
+                MetaReply.Refused -> MetaReply.Refused
+                else -> MetaReply.Ok(null)
+            }
+        }
+        if (response.code !in 200..299) return sort(response, DEFAULT_WAIT_MS) { null }
+        val id = json.optString("imdbID")
+        val name = json.optString("Title")
+        if (!Regex("tt[0-9]{7,9}").matches(id) || name.isBlank() || !json.optString("Type").equals(type, true)) return MetaReply.Failed(response.code)
+        return MetaReply.Ok(MetaCandidate(id, listOf(name), yearOf(json.optString("Year")), json.optString("Plot").takeUnless { it == "N/A" }.orEmpty(), json.optString("Poster").takeIf { it.startsWith("https://") }, null))
+    }
+
     suspend fun scores(key: String, imdbId: String): MetaReply<List<MetaScore>> {
         limiter.acquire()
         val url = "$BASE/?i=${enc(imdbId)}&apikey=${enc(key)}"

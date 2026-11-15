@@ -381,7 +381,7 @@ class GarbageInputTest {
             }
             val maze = TvMazeApi(http, limiter, "t")
             survive("TvMazeApi", shown) {
-                runBlocking { maze.show("q"); maze.episode("1", 1, 1); maze.episodes("1"); maze.extras("1") }
+                runBlocking { maze.search("q"); maze.episode("1", 1, 1); maze.episodes("1"); maze.extras("1") }
             }
             survive("OmdbApi", shown) { runBlocking { OmdbApi(http, limiter, "t").scores("k", "tt1") } }
             survive("WikidataApi", shown) { runBlocking { WikidataApi(http, limiter, "t").scores("tt1") } }

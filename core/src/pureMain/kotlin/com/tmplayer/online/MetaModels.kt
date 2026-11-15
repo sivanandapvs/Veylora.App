@@ -9,6 +9,7 @@ enum class MetaProvider(val label: String) {
     Tmdb("TMDB"),
     TvMaze("TVmaze"),
     AniList("AniList"),
+    Omdb("OMDb"),
 }
 
 /** A film or a show. Anime is either; [MetaQuery.anime] says which provider to ask first. */
@@ -52,7 +53,7 @@ data class MetaQuery(
      * audio [languages] (sorted, joined with "-") come last and only when there are some.
      */
     fun cacheKey(language: String): String = listOfNotNull(
-        kind.name,
+        if (kind == MetaKind.Show) "Show-v2" else "Film-v2",
         MetaMatch.normalise(title),
         year?.toString().orEmpty(),
         if (wantsEpisode) "${season ?: 1}x$episode" else "",

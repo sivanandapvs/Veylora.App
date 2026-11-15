@@ -265,14 +265,14 @@ class OnlineMetadata(
         }
         var blocked = false
         val order = when {
-            query.kind == MetaKind.Film && query.anime -> listOf(MetaProvider.Tmdb, MetaProvider.AniList)
-            query.kind == MetaKind.Film -> listOf(MetaProvider.Tmdb)
-            query.anime -> listOf(MetaProvider.AniList, MetaProvider.Tmdb, MetaProvider.TvMaze)
-            else -> listOf(MetaProvider.Tmdb, MetaProvider.TvMaze)
+            query.kind == MetaKind.Film && query.anime -> listOf(MetaProvider.Tmdb, MetaProvider.AniList, MetaProvider.Omdb)
+            query.kind == MetaKind.Film -> listOf(MetaProvider.Tmdb, MetaProvider.Omdb)
+            query.anime -> listOf(MetaProvider.AniList, MetaProvider.Tmdb, MetaProvider.TvMaze, MetaProvider.Omdb)
+            else -> if (query.tmdbId != null) listOf(MetaProvider.Tmdb, MetaProvider.TvMaze, MetaProvider.Omdb) else listOf(MetaProvider.TvMaze, MetaProvider.Tmdb, MetaProvider.Omdb)
         }
         for (provider in order) {
             when (val outcome = ask(provider, query, lang)) {
-                is Outcome.Found -> return MetaResult.Found(outcome.info) to true
+                is Outcome.Found -> return MetaResult.Found(outcome.info) to !blocked
                 Outcome.Nothing -> Unit
                 Outcome.Blocked -> blocked = true
             }
@@ -295,6 +295,7 @@ class OnlineMetadata(
             MetaProvider.Tmdb -> if (!tmdbUsable(s)) Outcome.Blocked else tmdbLookup(activeKey(s), query, lang)
             MetaProvider.TvMaze -> tvmazeLookup(query)
             MetaProvider.AniList -> anilistLookup(query)
+            MetaProvider.Omdb -> omdbLookup(query)
         }
     }
 
@@ -440,10 +441,9 @@ class OnlineMetadata(
 
     private suspend fun tvmazeLookup(query: MetaQuery): Outcome {
         if (query.kind != MetaKind.Show) return Outcome.Nothing
-        val reply = retrying { tvmaze.show(query.title) }
+        val reply = retrying { tvmaze.search(query.title) }
         trouble(MetaProvider.TvMaze, reply)?.let { return it }
-        val show = (reply as MetaReply.Ok).value ?: return Outcome.Nothing
-        if (!MetaMatch.accepts(query.title, query.year, show.names, show.year, show = true)) return Outcome.Nothing
+        val show = MetaPick.best(query, (reply as MetaReply.Ok).value, show = true) ?: return Outcome.Nothing
         return Outcome.Found(
             MetaInfo(
                 provider = MetaProvider.TvMaze,
@@ -456,6 +456,28 @@ class OnlineMetadata(
                 language = ENGLISH,
             ),
         )
+    }
+
+    private suspend fun omdbLookup(query: MetaQuery): Outcome {
+        if (!omdbUsable()) return Outcome.Nothing
+        val settings = store.now
+        val key = activeOmdbKey(settings)
+        return when (val reply = retrying { omdb.title(key, query.title, query.kind == MetaKind.Show) }) {
+            is MetaReply.Ok -> {
+                val candidate = reply.value
+                if (candidate == null || !MetaMatch.accepts(query.title, query.year, candidate.names, candidate.year, query.kind == MetaKind.Show)) Outcome.Nothing
+                else Outcome.Found(MetaInfo(MetaProvider.Omdb, candidate.id, query.kind, candidate.names.first(), candidate.year, candidate.overview, candidate.posterUrl))
+            }
+            MetaReply.Refused -> {
+                if (settings.omdbKey.isNotBlank()) store.update { it.copy(omdbRefusedKey = print(key)) } else omdbPausedUntil = nextDay()
+                Outcome.Blocked
+            }
+            is MetaReply.Throttled -> {
+                omdbPausedUntil = if (reply.retryAfterMs == OmdbApi.SPENT) nextDay() else now() + reply.retryAfterMs
+                Outcome.Blocked
+            }
+            is MetaReply.Failed -> Outcome.Blocked
+        }
     }
 
     private suspend fun anilistLookup(query: MetaQuery): Outcome {
@@ -485,11 +507,26 @@ class OnlineMetadata(
     private suspend fun episodeFor(show: MetaInfo, query: MetaQuery, lang: String): Pair<MetaEpisode?, Boolean> {
         val season = query.season ?: 1
         val number = query.episode ?: return null to true
-        if (paused(show.provider)) return null to false
         return when (show.provider) {
             MetaProvider.Tmdb -> {
+                // Resolve the TVmaze identifier independently; a TMDB id is never a TVmaze id.
+                var mazeComplete = true
+                if (!query.anime && !paused(MetaProvider.TvMaze)) {
+                    when (val match = tvmazeLookup(query.showOnly())) {
+                        is Outcome.Found -> {
+                            val episode = retrying { tvmaze.episode(match.info.id, season, number) }
+                            when (trouble(MetaProvider.TvMaze, episode)) {
+                                null -> (episode as MetaReply.Ok).value?.let { return it to true }
+                                Outcome.Blocked -> mazeComplete = false
+                                else -> Unit
+                            }
+                        }
+                        Outcome.Blocked -> mazeComplete = false
+                        Outcome.Nothing -> Unit
+                    }
+                } else if (!query.anime) mazeComplete = false
                 val s = store.now
-                if (!tmdbUsable(s)) return null to false
+                if (!tmdbUsable(s) || paused(MetaProvider.Tmdb)) return null to false
                 val key = activeKey(s)
                 val reply = retrying { tmdb.episode(key, show.id, season, number, lang) }
                 if (reply is MetaReply.Failed && reply.code == 404) return null to true
@@ -504,15 +541,24 @@ class OnlineMetadata(
                         )
                     }
                 }
-                episode to true
+                episode to mazeComplete
             }
             MetaProvider.TvMaze -> {
-                val reply = retrying { tvmaze.episode(show.id, season, number) }
-                trouble(MetaProvider.TvMaze, reply)?.let { return null to false }
-                (reply as MetaReply.Ok).value to true
+                val reply = if (paused(MetaProvider.TvMaze)) MetaReply.Throttled(0) else retrying { tvmaze.episode(show.id, season, number) }
+                val problem = if (paused(MetaProvider.TvMaze)) Outcome.Blocked else trouble(MetaProvider.TvMaze, reply)
+                if (problem == null) (reply as MetaReply.Ok).value?.let { return it to true }
+                val complete = problem != Outcome.Blocked
+                val s = store.now
+                if (!tmdbUsable(s) || paused(MetaProvider.Tmdb)) return null to false
+                val match = tmdbLookup(activeKey(s), query.showOnly().copy(tmdbId = null), lang)
+                if (match !is Outcome.Found || match.info.kind != MetaKind.Show) return null to (complete && match == Outcome.Nothing)
+                val episode = retrying { tmdb.episode(activeKey(s), match.info.id, season, number, lang) }
+                if (episode is MetaReply.Failed && episode.code == 404) return null to complete
+                trouble(MetaProvider.Tmdb, episode, activeKey(s))?.let { return null to false }
+                (episode as MetaReply.Ok).value to complete
             }
             // AniList lists no episodes; the show's own words stand for each one.
-            MetaProvider.AniList -> null to true
+            MetaProvider.AniList, MetaProvider.Omdb -> null to true
         }
     }
 
@@ -560,6 +606,7 @@ class OnlineMetadata(
             cache.skipTimes(key)?.let { return@withLock it }
             val reply = when (info.provider) {
                 MetaProvider.Tmdb -> skipApi.theIntroDb(info.id, null, null, season, episode)
+                MetaProvider.Omdb -> skipApi.theIntroDb(null, info.id, null, season, episode)
                 MetaProvider.TvMaze -> {
                     val ids = providerExtras(info) ?: return@withLock emptyList()
                     if (ids.imdbId == null && ids.tvdbId == null) return@withLock emptyList()
@@ -856,6 +903,7 @@ class OnlineMetadata(
             }
             MetaProvider.TvMaze -> reply = retrying { tvmaze.extras(info.id) }
             MetaProvider.AniList -> reply = retrying { anilist.extras(info.id) }
+            MetaProvider.Omdb -> return MetaExtras(imdbId = info.id)
         }
         return when (trouble(info.provider, reply, key)) {
             null -> (reply as MetaReply.Ok).value
@@ -931,7 +979,7 @@ class OnlineMetadata(
                     }
                     found
                 }
-                MetaProvider.AniList -> null
+                MetaProvider.AniList, MetaProvider.Omdb -> null
             }
         }
     }
