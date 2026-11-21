@@ -38,6 +38,13 @@ data class MetaQuery(
      * with it); a name that lists none keeps its old key, so answers already kept for it stand.
      */
     val languages: List<String> = emptyList(),
+    val imdbId: String? = null,
+    val torBoxKey: String? = null,
+    val transferTitle: String? = null,
+    val transferYear: Int? = null,
+    val explicitKind: MetaKind? = null,
+    val correctionTitle: String? = null,
+    val manuallyChosen: Boolean = false,
 ) {
     /** True when an episode's own name and words are wanted, not only the show's. */
     val wantsEpisode: Boolean get() = kind == MetaKind.Show && episode != null
@@ -53,7 +60,14 @@ data class MetaQuery(
      * audio [languages] (sorted, joined with "-") come last and only when there are some.
      */
     fun cacheKey(language: String): String = listOfNotNull(
-        if (kind == MetaKind.Show) "Show-v2" else "Film-v2",
+        if (kind == MetaKind.Show) "Show-v3" else "Film-v3",
+        torBoxKey,
+        correctionTitle,
+        "chosen".takeIf { manuallyChosen },
+        imdbId,
+        explicitKind?.name,
+        transferTitle,
+        transferYear?.toString(),
         MetaMatch.normalise(title),
         year?.toString().orEmpty(),
         if (wantsEpisode) "${season ?: 1}x$episode" else "",
@@ -64,7 +78,36 @@ data class MetaQuery(
     ).joinToString("|")
 
     companion object {
-        private val FORCED = Regex("""\{tmdb-(\d{1,9})\}""", RegexOption.IGNORE_CASE)
+        private val FORCED = Regex("""\{tmdb-(?:(movie|tv)-)?(\d{1,9})\}""", RegexOption.IGNORE_CASE)
+        private val TMDB_LINK = Regex("""\bthemoviedb\.org/(movie|tv)/(\d{1,9})(?!\d)""", RegexOption.IGNORE_CASE)
+        private val IMDB_ID = Regex("""(?<![a-z0-9])tt\d{7,12}(?![a-z0-9])""", RegexOption.IGNORE_CASE)
+        private val ID_TEXT = Regex("""(?:https?://(?:www\.)?)?themoviedb\.org/(?:movie|tv)/\d+(?:-[\w-]+)?/?|(?:https?://(?:www\.)?imdb\.com/title/|\{imdb[-=:])?(?<![a-z0-9])tt\d{7,12}(?![a-z0-9])[/}]?""", RegexOption.IGNORE_CASE)
+
+        internal fun withoutIds(text: String): String = text.replace(FORCED, " ").replace(ID_TEXT, " ")
+
+        internal fun forTorBox(item: com.tmplayer.data.MediaItem): MetaQuery {
+            val parsed = item.parsedName
+            val ids = of(item.fileName, listOf(item.torBoxMarkers, item.caption, item.torBoxTransferName).joinToString("\n"))
+            val transfer = of(item.torBoxTransferName)
+            val individual = of(item.fileName)
+            val year = individual?.year ?: parsed.year.takeIf {
+                transfer == null || MetaMatch.normalise(parsed.title) == MetaMatch.normalise(transfer.title)
+            }
+            return MetaQuery(
+                title = parsed.title,
+                year = year,
+                season = parsed.season ?: if (parsed.episode != null) 1 else null,
+                episode = parsed.episode,
+                kind = if (parsed.isSeries || ids?.explicitKind == MetaKind.Show) MetaKind.Show else MetaKind.Film,
+                tmdbId = ids?.tmdbId,
+                imdbId = ids?.imdbId,
+                explicitKind = ids?.explicitKind,
+                torBoxKey = item.id,
+                transferTitle = transfer?.title,
+                transferYear = transfer?.year,
+            )
+        }
+
         private val FANSUB_GROUP = Regex("""^\s*\[[^\]]{2,40}\]""")
         private val DASH_EPISODE = Regex("""\s-\s\d{1,4}(?:v\d)?(?:\s|\(|\[|$)""")
         private val WORDY = Regex("""^\p{L}{2,}""")
@@ -84,12 +127,17 @@ data class MetaQuery(
          * title left once the release tags are gone, or one too short to match safely.
          */
         fun of(fileName: String, caption: String? = null): MetaQuery? {
-            val forced = FORCED.find(fileName)?.groupValues?.get(1)?.toIntOrNull()
-                ?: caption?.let { FORCED.find(it) }?.groupValues?.get(1)?.toIntOrNull()
-            val name = fileName.replace(FORCED, " ")
-            val parsed = MediaName.parse(name, caption?.replace(FORCED, " "))
+            val text = fileName + "\n" + caption.orEmpty()
+            val matched = FORCED.find(text)
+            val marker = matched?.groupValues?.get(2)?.toIntOrNull()?.takeIf { it > 0 }
+            val link = if (marker == null) TMDB_LINK.find(text) else null
+            val forced = marker ?: link?.groupValues?.get(2)?.toIntOrNull()?.takeIf { it > 0 }
+            val kind = matched?.groupValues?.get(1)?.takeIf { it.isNotBlank() } ?: link?.groupValues?.get(1)
+            val imdb = IMDB_ID.find(text)?.value?.lowercase()
+            val name = withoutIds(fileName)
+            val parsed = MediaName.parse(name, caption?.let(::withoutIds))
             val title = parsed.title.trim()
-            if (forced == null && !meaningful(title, parsed.year)) return null
+            if (forced == null && imdb == null && !meaningful(title, parsed.year)) return null
             val anime = parsed.season == null && parsed.episode != null &&
                 (FANSUB_GROUP.containsMatchIn(name) || DASH_EPISODE.containsMatchIn(name)) && !SXXEXX.containsMatchIn(name)
             return MetaQuery(
@@ -100,7 +148,9 @@ data class MetaQuery(
                 anime = anime,
                 tmdbId = forced,
                 // A daily show named by its air date is a show, though it names no episode number.
-                kind = if (parsed.isSeries) MetaKind.Show else MetaKind.Film,
+                kind = if (parsed.isSeries || kind.equals("tv", true)) MetaKind.Show else MetaKind.Film,
+                imdbId = imdb.takeIf { forced == null },
+                explicitKind = kind?.let { if (it.equals("tv", true)) MetaKind.Show else MetaKind.Film },
                 languages = (MediaName.languages(name) + (caption?.let { MediaName.languages(it.replace(FORCED, " ")) } ?: emptyList())).distinct(),
             )
         }
@@ -136,6 +186,8 @@ data class MetaInfo(
     /** The language [overview] is in, as the provider was asked for it. */
     val language: String = "en",
     val episode: MetaEpisode? = null,
+    val originalTitle: String? = null,
+    val date: String? = null,
 ) {
     /** The best picture for a 16:9 tile: the episode's own still, the show's backdrop, its poster. */
     val wideUrl: String? get() = episode?.stillUrl ?: backdropUrl
@@ -150,12 +202,15 @@ data class MetaInfo(
         .put("poster", posterUrl.orEmpty())
         .put("backdrop", backdropUrl.orEmpty())
         .put("language", language)
+        .put("originalTitle", originalTitle.orEmpty())
+        .put("date", date.orEmpty())
         .apply {
             episode?.let {
                 put(
                     "episode",
                     JSONObject().put("season", it.season).put("number", it.number).put("name", it.name)
-                        .put("overview", it.overview).put("still", it.stillUrl.orEmpty()),
+                        .put("overview", it.overview).put("still", it.stillUrl.orEmpty())
+                        .put("airDate", it.airDate.orEmpty()).put("runtime", it.runtimeMin ?: 0),
                 )
             }
         }
@@ -172,6 +227,8 @@ data class MetaInfo(
                 posterUrl = json.optString("poster").ifBlank { null },
                 backdropUrl = json.optString("backdrop").ifBlank { null },
                 language = json.optString("language", "en"),
+                originalTitle = json.optString("originalTitle").ifBlank { null },
+                date = json.optString("date").ifBlank { null },
                 episode = json.optJSONObject("episode")?.let {
                     MetaEpisode(
                         season = it.optInt("season"),
@@ -179,6 +236,8 @@ data class MetaInfo(
                         name = it.optString("name"),
                         overview = it.optString("overview"),
                         stillUrl = it.optString("still").ifBlank { null },
+                        airDate = it.optString("airDate").ifBlank { null },
+                        runtimeMin = it.optInt("runtime").takeIf { minutes -> minutes > 0 },
                     )
                 },
             )

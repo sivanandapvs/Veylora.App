@@ -105,7 +105,10 @@ internal fun PosterPickerSheet(
                             ) {
                                 if (!chosen) {
                                     chosen = true
-                                    onPick(choice.pick, if (alsoOthers) others else emptyList())
+                                    val pick = if (item.identity is com.tmplayer.data.MediaIdentity.TorBox) {
+                                        choice.pick.copy(posterUrl = choice.posterUrl)
+                                    } else choice.pick
+                                    onPick(pick, if (alsoOthers) others else emptyList())
                                 }
                             }
                         }

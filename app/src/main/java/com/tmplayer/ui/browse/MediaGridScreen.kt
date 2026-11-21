@@ -2116,8 +2116,11 @@ internal fun MediaCard(
     // This video's correction alone, from the screen's one collector ([LocalTileShared]).
     val renamed = com.tmplayer.ui.components.rememberCorrection(item.id)?.title
     val named = if (poster) remember(item, renamed) { SeriesShelf.posterTitle(item) } else tileTitle(item)
+    val cloudMeta = if (item.identity is com.tmplayer.data.MediaIdentity.TorBox) {
+        com.tmplayer.ui.online.rememberMetaState(item, showOnly = true)
+    } else null
     VideoTile(
-        title = title ?: named,
+        title = title ?: cloudMeta?.value?.title?.takeIf { renamed == null && item.extra == null } ?: named,
         onClick = onClick,
         onLongClick = onLongClick,
         onFocused = onFocused,
@@ -2136,6 +2139,7 @@ internal fun MediaCard(
             selected = selected,
             badge = badge,
             poster = poster,
+            knownMeta = cloudMeta,
             modifier = Modifier.fillMaxSize(),
         )
     }
@@ -2513,6 +2517,7 @@ private fun MediaArt(
      * fill most of a picture this size.
      */
     thumb: Boolean = false,
+    knownMeta: com.tmplayer.ui.online.MetaState<com.tmplayer.online.MetaInfo>? = null,
 ) {
     val s = LocalStrings.current
     val named = rememberCover(item)
@@ -2521,7 +2526,7 @@ private fun MediaArt(
     val cover = named
     val inset = if (compact) 4.dp else TileBadgeInset
     // Whether the answer is still on its way too: a television holds the thumbnail back for it.
-    val meta = com.tmplayer.ui.online.rememberMetaState(item, showOnly = true)
+    val meta = knownMeta ?: com.tmplayer.ui.online.rememberMetaState(item, showOnly = true)
     Box(modifier) {
         if (poster) {
             PosterArt(

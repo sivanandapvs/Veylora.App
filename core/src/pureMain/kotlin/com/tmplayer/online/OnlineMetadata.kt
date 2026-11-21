@@ -174,7 +174,10 @@ class OnlineMetadata(
         remembered(key)?.let { return it }
         return lockFor(key).withLock {
             remembered(key)?.let { return@withLock it }
+            val retryKey = key + "|" + print(activeKey(store.now))
+            if (query.torBoxKey != null && (torBoxRetry[retryKey] ?: 0L) > now()) return@withLock MetaResult.Unavailable
             val (result, keep) = resolve(query, lang)
+            if (query.torBoxKey != null && result == MetaResult.Unavailable) torBoxRetry[retryKey] = now() + 30_000L
             if (keep) {
                 cache.putAnswer(key, result)
                 memory[key] = result
@@ -243,6 +246,8 @@ class OnlineMetadata(
         return PosterChoices.Found(choices)
     }
 
+    private val torBoxRetry = LruMap<String, Long>(MEMORY_ENTRIES)
+
     private fun remembered(key: String): MetaResult? {
         memory[key]?.let { return it }
         val stored = cache.answer(key) ?: return null
@@ -260,11 +265,14 @@ class OnlineMetadata(
         if (query.wantsEpisode) {
             val show = lookup(query.showOnly())
             if (show !is MetaResult.Found) return show to (show is MetaResult.NoMatch)
+            if (show.info.kind != MetaKind.Show) return show to true
             val (episode, complete) = episodeFor(show.info, query, lang)
             return MetaResult.Found(show.info.copy(episode = episode)) to complete
         }
+        if (query.torBoxKey != null) return resolveTorBox(query, lang)
         var blocked = false
         val order = when {
+            query.imdbId != null || query.explicitKind != null -> listOf(MetaProvider.Tmdb)
             query.kind == MetaKind.Film && query.anime -> listOf(MetaProvider.Tmdb, MetaProvider.AniList, MetaProvider.Omdb)
             query.kind == MetaKind.Film -> listOf(MetaProvider.Tmdb, MetaProvider.Omdb)
             query.anime -> listOf(MetaProvider.AniList, MetaProvider.Tmdb, MetaProvider.TvMaze, MetaProvider.Omdb)
@@ -332,10 +340,18 @@ class OnlineMetadata(
         var film = query.kind == MetaKind.Film
         // The match as the English search gave it, when that is where it was found.
         var inEnglish: MetaCandidate? = null
-        var candidate: MetaCandidate = if (query.tmdbId != null) {
-            val reply = retrying { if (film) tmdb.movie(key, query.tmdbId.toString(), lang) else tmdb.tv(key, query.tmdbId.toString(), lang) }
+        val linked = if (query.tmdbId == null && query.imdbId != null) {
+            val reply = retrying { tmdb.findByImdb(key, query.imdbId) }
             trouble(MetaProvider.Tmdb, reply, key)?.let { return it }
-            (reply as MetaReply.Ok).value
+            (reply as MetaReply.Ok).value.singleOrNull() ?: return Outcome.Nothing
+        } else null
+        film = query.explicitKind?.let { it == MetaKind.Film } ?: linked?.first ?: film
+        var candidate: MetaCandidate = if (query.tmdbId != null || linked != null) {
+            linked?.second ?: run {
+                val reply = retrying { if (film) tmdb.movie(key, query.tmdbId.toString(), lang) else tmdb.tv(key, query.tmdbId.toString(), lang) }
+                trouble(MetaProvider.Tmdb, reply, key)?.let { return it }
+                (reply as MetaReply.Ok).value
+            }
         } else {
             // In another language the titles TMDB answers with are that language's, or the original
             // where nobody translated it ("Le Fabuleux Destin d'Amélie Poulain" in Arabic), and a
@@ -366,7 +382,7 @@ class OnlineMetadata(
             found ?: return Outcome.Nothing
         }
         var poster = candidate.posterUrl
-        if (lang != ENGLISH) {
+        run {
             // The title in the UI language, and its poster chosen by [MetaRules.poster] rather than
             // whichever one TMDB names for this language: one call, with the posters appended. A
             // failure here keeps what the search said.
@@ -374,12 +390,18 @@ class OnlineMetadata(
             val imageLanguages = listOf(ui, "en", "null", candidate.originalLanguage.lowercase()).filter { it.isNotBlank() }.distinct()
             val localized = retrying { tmdb.localized(key, film, candidate.id, lang, imageLanguages) }
             if (localized is MetaReply.Ok) {
-                val (local, posters) = localized.value
+                val (local, posters, backdrops) = localized.value
                 val original = local.originalLanguage.ifBlank { candidate.originalLanguage }
-                poster = MetaRules.poster(posters, lang, original)?.let { tmdb.posterUrl(it) } ?: local.posterUrl ?: poster
+                poster = MetaRules.poster(posters, lang, original)?.let { tmdb.rankedImageUrl(key, it, true) }
+                    ?: (local.posterUrl ?: poster).takeIf { posters.isEmpty() }
                 candidate = local.copy(
-                    names = (local.names + candidate.names).filter { it.isNotBlank() }.distinct(),
-                    backdropUrl = local.backdropUrl ?: candidate.backdropUrl,
+                    names = listOf(local.names.firstOrNull().orEmpty().ifBlank { candidate.names.firstOrNull().orEmpty() },
+                        local.names.getOrNull(1).orEmpty().ifBlank { candidate.names.getOrNull(1).orEmpty() }),
+                    date = local.date ?: candidate.date,
+                    year = local.year ?: candidate.year,
+                    overview = local.overview.ifBlank { if (inEnglish == null) candidate.overview else "" },
+                    backdropUrl = MetaRules.backdrop(backdrops, lang, original)?.let { tmdb.rankedImageUrl(key, it, false) }
+                        ?: (local.backdropUrl ?: candidate.backdropUrl).takeIf { backdrops.isEmpty() },
                     originalLanguage = original,
                 )
             } else if (inEnglish != null) {
@@ -400,6 +422,111 @@ class OnlineMetadata(
         return Outcome.Found(info(query, candidate, film, poster, overview, overviewLang))
     }
 
+    private suspend fun resolveTorBox(query: MetaQuery, lang: String): Pair<MetaResult, Boolean> {
+        val stableKey = "TorBoxIdentity-v1|" + query.torBoxKey + "|" + query.correctionTitle.orEmpty()
+        val identityKey = if (query.tmdbId != null || query.imdbId != null) {
+            listOf(stableKey, query.tmdbId, query.imdbId, query.explicitKind, query.manuallyChosen).joinToString("|")
+        } else stableKey
+        val saved = (cache.answer(identityKey) as? MetaResult.Found)?.info
+        val offline = saved?.let { MetaResult.Found(it) } ?: MetaResult.Unavailable
+        val settings = store.now
+        if (!tmdbUsable(settings) || paused(MetaProvider.Tmdb)) {
+            return offline to false
+        }
+        val key = activeKey(settings)
+        val kinds = when {
+            query.explicitKind != null -> listOf(query.explicitKind == MetaKind.Film)
+            query.kind == MetaKind.Show -> listOf(false)
+            else -> listOf(true, false)
+        }
+        val selected = when {
+            saved != null -> (saved.kind == MetaKind.Film) to saved.id
+            query.tmdbId != null && kinds.size == 1 -> kinds.single() to query.tmdbId.toString()
+            query.tmdbId != null -> {
+                val matches = mutableListOf<Pair<Boolean, MetaCandidate>>()
+                for (film in kinds) {
+                    val reply = retrying {
+                        if (film) tmdb.movie(key, query.tmdbId.toString(), lang) else tmdb.tv(key, query.tmdbId.toString(), lang)
+                    }
+                    if (trouble(MetaProvider.Tmdb, reply, key) == Outcome.Blocked) return MetaResult.Unavailable to false
+                    if (reply is MetaReply.Ok) matches += film to reply.value
+                }
+                (matches.singleOrNull() ?: matches.filter { (_, candidate) -> torBoxScore(query, candidate) > 0 }.singleOrNull())
+                    ?.let { (film, candidate) -> film to candidate.id }
+            }
+            query.imdbId != null -> {
+                val reply = retrying { tmdb.findByImdb(key, query.imdbId) }
+                if (trouble(MetaProvider.Tmdb, reply, key) == Outcome.Blocked) return MetaResult.Unavailable to false
+                (reply as? MetaReply.Ok)?.value?.filter { it.first in kinds }?.singleOrNull()?.let { it.first to it.second.id }
+            }
+            else -> {
+                val results = mutableListOf<Pair<Boolean, MetaCandidate>>()
+                val names = listOf(query.title to query.year, query.transferTitle.orEmpty() to query.transferYear)
+                    .filter { (title, year) -> title.isNotBlank() && (title.any(Char::isLetter) || year != null) }
+                    .distinctBy { (title, year) -> MetaMatch.normalise(title) to year }
+                for ((title, year) in names) {
+                    for (film in kinds) {
+                        for (language in listOf(lang, ENGLISH).distinct()) {
+                            val searchYear = year.takeIf { film || query.kind != MetaKind.Show }
+                            val reply = retrying {
+                                if (film) tmdb.searchMovie(key, title, searchYear, language)
+                                else tmdb.searchTv(key, title, searchYear, language)
+                            }
+                            if (trouble(MetaProvider.Tmdb, reply, key) == Outcome.Blocked) return MetaResult.Unavailable to false
+                            if (reply is MetaReply.Ok) results += reply.value.map { film to it }
+                            if (reply is MetaReply.Ok && reply.value.any { torBoxScore(query, it) > 0 }) break
+                        }
+                    }
+                }
+                val ranked = results.filter { it.second.id.toIntOrNull()?.let { id -> id > 0 } == true }
+                    .groupBy { it.first to it.second.id }
+                    .mapValues { (_, variants) -> variants.maxOf { torBoxScore(query, it.second) } }
+                    .filterValues { it > 0 }
+                val best = ranked.values.maxOrNull()
+                ranked.filterValues { it == best }.keys.singleOrNull()
+            }
+        } ?: return MetaResult.NoMatch to true
+
+        val (film, id) = selected
+        val detailsKey = "TorBoxDetails-v1|" + film + "|" + id + "|" + lang
+        val result = lockFor(detailsKey).withLock {
+            remembered(detailsKey)?.let { return@withLock it }
+            val details = query.copy(tmdbId = id.toIntOrNull(), kind = if (film) MetaKind.Film else MetaKind.Show,
+                explicitKind = if (film) MetaKind.Film else MetaKind.Show)
+            if (details.tmdbId == null) return@withLock MetaResult.NoMatch
+            when (val outcome = tmdbLookup(key, details, lang)) {
+                is Outcome.Found -> MetaResult.Found(outcome.info).also {
+                    cache.putAnswer(detailsKey, it)
+                    memory[detailsKey] = it
+                }
+                Outcome.Nothing -> MetaResult.NoMatch
+                Outcome.Blocked -> MetaResult.Unavailable
+            }
+        }
+        if (result is MetaResult.Found) {
+            cache.putAnswer(identityKey, result)
+            // A provider-supplied ID can disappear from a renamed file. Keep the confirmed title
+            // under the source identity as well, without replacing its automatic match on a manual pick.
+            if (!query.manuallyChosen && identityKey != stableKey) cache.putAnswer(stableKey, result)
+        }
+        if (result !is MetaResult.Found && saved != null) return MetaResult.Found(saved) to false
+        return result to (result != MetaResult.Unavailable)
+    }
+
+    private fun torBoxScore(query: MetaQuery, candidate: MetaCandidate): Int {
+        val names = candidate.names.map(MetaMatch::normalise).filter { it.isNotBlank() }
+        val episodic = query.kind == MetaKind.Show
+        fun score(title: String?, year: Int?): Int {
+            if (title.isNullOrBlank() || MetaMatch.normalise(title) !in names) return 0
+            return when {
+                year != null && year == candidate.year -> 3
+                episodic && (year == null || candidate.year?.let { it <= year } == true) -> 1
+                else -> 0
+            }
+        }
+        return maxOf(score(query.title, query.year), score(query.transferTitle, query.transferYear))
+    }
+
     private fun info(query: MetaQuery, candidate: MetaCandidate, film: Boolean, poster: String?, overview: String, overviewLang: String) = MetaInfo(
         provider = MetaProvider.Tmdb,
         id = candidate.id,
@@ -410,6 +537,8 @@ class OnlineMetadata(
         posterUrl = poster,
         backdropUrl = candidate.backdropUrl,
         language = overviewLang,
+        originalTitle = candidate.names.getOrNull(1)?.takeIf { it.isNotBlank() },
+        date = candidate.date,
     )
 
     private sealed interface SearchOutcome {
@@ -511,7 +640,7 @@ class OnlineMetadata(
             MetaProvider.Tmdb -> {
                 // Resolve the TVmaze identifier independently; a TMDB id is never a TVmaze id.
                 var mazeComplete = true
-                if (!query.anime && !paused(MetaProvider.TvMaze)) {
+                if (query.torBoxKey == null && !query.anime && !paused(MetaProvider.TvMaze)) {
                     when (val match = tvmazeLookup(query.showOnly())) {
                         is Outcome.Found -> {
                             val episode = retrying { tvmaze.episode(match.info.id, season, number) }
@@ -524,7 +653,7 @@ class OnlineMetadata(
                         Outcome.Blocked -> mazeComplete = false
                         Outcome.Nothing -> Unit
                     }
-                } else if (!query.anime) mazeComplete = false
+                } else if (query.torBoxKey == null && !query.anime) mazeComplete = false
                 val s = store.now
                 if (!tmdbUsable(s) || paused(MetaProvider.Tmdb)) return null to false
                 val key = activeKey(s)
@@ -652,6 +781,9 @@ class OnlineMetadata(
      */
     suspend fun matched(item: MediaItem, name: com.tmplayer.data.ParsedName, info: MetaInfo): MatchedMeta? {
         chosen(item, info)?.let { return it }
+        if (item.identity is com.tmplayer.data.MediaIdentity.TorBox && info.provider == MetaProvider.Tmdb) {
+            return MatchedMeta(info, MatchBasis.TorBoxResolved)
+        }
         MetaConfidence.basis(name, info)?.let { return MatchedMeta(info, it) }
         if (!MetaConfidence.needsRuntime(name, info, item.durationSec)) return null
         val key = runtimeKey(item, name, info)
@@ -670,6 +802,9 @@ class OnlineMetadata(
      */
     fun peekMatched(item: MediaItem, name: com.tmplayer.data.ParsedName, info: MetaInfo): MatchedMeta? {
         chosen(item, info)?.let { return it }
+        if (item.identity is com.tmplayer.data.MediaIdentity.TorBox && info.provider == MetaProvider.Tmdb) {
+            return MatchedMeta(info, MatchBasis.TorBoxResolved)
+        }
         MetaConfidence.basis(name, info)?.let { return MatchedMeta(info, it) }
         if (!MetaConfidence.needsRuntime(name, info, item.durationSec)) return null
         return runtimeVerdicts[runtimeKey(item, name, info)]?.matched

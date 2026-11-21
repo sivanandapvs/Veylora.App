@@ -57,8 +57,12 @@ internal fun SeriesCard(
     onLongClick: (() -> Unit)? = null,
 ) {
     val summary = listOfNotNull(seriesSummary(series), seriesProgressLine(progress)).joinToString("  ·  ")
+    val cloudTitle = if (series.cover.identity is com.tmplayer.data.MediaIdentity.TorBox) {
+        com.tmplayer.ui.components.rememberCorrection(series.cover.id)?.title
+            ?: com.tmplayer.ui.online.rememberMeta(series.cover, showOnly = true)?.title
+    } else null
     VideoTile(
-        title = series.title,
+        title = cloudTitle ?: series.title,
         onClick = onClick,
         onFocused = onFocused,
         onLongClick = onLongClick ?: LocalSeriesHold.current?.let { hold -> { hold(series) } },

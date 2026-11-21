@@ -17,6 +17,9 @@ enum class MatchBasis {
 
     /** The viewer picked this title for the video ("Choose the right poster"): nothing else has to back it. */
     Chosen,
+
+    /** The TorBox resolver confirmed the identifier or the release information. */
+    TorBoxResolved,
 }
 
 /** A provider's answer for one video, with what it rests on. */

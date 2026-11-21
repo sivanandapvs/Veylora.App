@@ -1048,7 +1048,8 @@ fun SeriesPanel(
         }
         val overview: @Composable () -> Unit = {
             val text = meta?.overview?.takeIf { it.isNotBlank() }
-            if (text != null || holdOverview) {
+            val firstAirDate = meta?.date?.takeIf { series.cover.identity is com.tmplayer.data.MediaIdentity.TorBox }
+            if (text != null || holdOverview || firstAirDate != null) {
                 Column(Modifier.then(if (large) Modifier.widthIn(max = LARGE_READING) else Modifier), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     SynopsisSlot(
                         text,
@@ -1060,6 +1061,7 @@ fun SeriesPanel(
                     // The credit's line kept with the held words, so it does not add one when they come.
                     Box(Modifier.neverShrink()) { meta?.let { if (text != null) MetaCredit(it) } }
                     MetaPeopleLine(extras)
+                    firstAirDate?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = Tone.muted) }
                 }
             }
         }
@@ -1342,7 +1344,12 @@ fun SeriesPanel(
                     item(key = "meta-cast") { MetaCastRow(extras.cast, Modifier.padding(pad).padding(top = 16.dp)) }
                 }
                 if (extras.similar.isNotEmpty() && onOpenItem != null) {
-                    item(key = "meta-more") { MoreLikeThisRow(meta, extras, onOpenItem, Modifier.padding(pad).padding(top = 16.dp)) }
+                    item(key = "meta-more") {
+                        MoreLikeThisRow(
+                            meta, extras, onOpenItem, Modifier.padding(pad).padding(top = 16.dp),
+                            remoteFallback = series.cover.identity is com.tmplayer.data.MediaIdentity.TorBox,
+                        )
+                    }
                 }
             }
         }

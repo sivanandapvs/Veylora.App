@@ -707,11 +707,33 @@ private fun BelowTheFold(
         holds.cast && !page.extrasState.settled -> com.tmplayer.ui.online.MetaCastPlaceholder()
     }
     SeasonsSection(item, meta, extras, onOpenItem, episodesModifier)
-    if (meta != null && extras != null) MoreLikeThisRow(meta, extras, onOpenItem)
+    val torBox = item.identity is com.tmplayer.data.MediaIdentity.TorBox
+    if (meta != null && extras != null) MoreLikeThisRow(meta, extras, onOpenItem, remoteFallback = torBox)
     Column(Modifier.widthIn(max = 720.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(s.detailAbout, style = MaterialTheme.typography.titleSmall, color = Tone.text)
         // Who made it, here with the credits rather than over Play, where it arrived late.
         MetaPeopleLine(extras)
+        if (torBox) {
+            if (meta == null && page.metaState.settled) {
+                Text("Showing TorBox file information", color = Tone.muted, style = MaterialTheme.typography.bodyMedium)
+            }
+            val factsLine = listOfNotNull(
+                meta?.let { info -> info.originalTitle?.takeUnless { it == info.title } },
+                meta?.date,
+                extras?.voteCount?.let { "$it TMDB votes" },
+            ).joinToString(" \u00b7 ")
+            if (factsLine.isNotBlank()) Text(factsLine, color = Tone.muted, style = MaterialTheme.typography.bodyMedium)
+            val imdb = extras?.imdbId?.takeIf { Regex("""tt\d{7,12}""").matches(it) }
+            if (imdb != null) {
+                val uri = androidx.compose.ui.platform.LocalUriHandler.current
+                Text(
+                    "IMDb \u00b7 $imdb",
+                    modifier = Modifier.clickable { runCatching { uri.openUri("https://www.imdb.com/title/$imdb/") } },
+                    color = Tone.text,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        }
         DetailFacts(item, facts, s, overview = null, showSynopsis = false)
         meta?.let { MetaCredit(it) }
     }

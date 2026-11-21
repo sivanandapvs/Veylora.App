@@ -1,6 +1,7 @@
 package com.tmplayer.online
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.async
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -96,7 +97,7 @@ class OnlineMetadataTest {
         assertEquals("A giant rabbit has had enough.", info.overview)
         assertEquals("https://image.tmdb.org/t/p/w342/bbb.jpg", info.posterUrl)
         assertEquals("https://image.tmdb.org/t/p/w780/bbb-wide.jpg", info.backdropUrl)
-        val sent = http.requests.single().url
+        val sent = http.requests.single { "search/movie" in it.url }.url
         assertTrue(sent, "query=Big+Buck+Bunny" in sent && "year=2008" in sent && "language=en-US" in sent)
         assertTrue("the key travels as api_key", "api_key=build-key" in sent)
     }
@@ -106,7 +107,7 @@ class OnlineMetadataTest {
         http.on("search/movie") { bunnySearch }
         val token = "eyJ" + "a".repeat(60)
         metadata(key = token).lookup(query("Big Buck Bunny (2008).mp4"))
-        val sent = http.requests.single()
+        val sent = http.requests.single { "search/movie" in it.url }
         assertFalse(token in sent.url)
         assertEquals("Bearer $token", sent.headers["Authorization"])
     }
@@ -508,7 +509,7 @@ class OnlineMetadataTest {
         assertEquals("en-US", info.language)
         // No Arabic poster: the best English or wordless one, not the badge or the banner,
         // and not the French one TMDB itself would name.
-        assertEquals("https://image.tmdb.org/t/p/w342/en-top.jpg", info.posterUrl)
+        assertEquals("https://image.tmdb.org/t/p/w500/en-top.jpg", info.posterUrl)
         val localized = http.requests.single { "movie/194" in it.url }.url
         assertTrue(localized, "append_to_response=images" in localized && "include_image_language=ar,en,null,fr" in localized)
         assertEquals(0, http.count("movie/194?language=en-US"))
@@ -521,7 +522,7 @@ class OnlineMetadataTest {
             amelieLocalizedAr.replace(""""file_path":"/none.jpg","iso_639_1":null""", """"file_path":"/ar.jpg","iso_639_1":"ar"""")
         }
         val info = (metadata(lang = "ar").lookup(query("Amelie.2001.mkv")) as MetaResult.Found).info
-        assertEquals("https://image.tmdb.org/t/p/w342/ar.jpg", info.posterUrl)
+        assertEquals("https://image.tmdb.org/t/p/w500/ar.jpg", info.posterUrl)
     }
 
     @Test
@@ -536,18 +537,153 @@ class OnlineMetadataTest {
     }
 
     @Test
-    fun englishAsksOnceWithNoPosterCall() = runBlocking {
-        http.on("search/movie") { amelieSearchEn }
-        val info = (metadata(lang = "en").lookup(query("Amelie.2001.mkv")) as MetaResult.Found).info
-        assertEquals("https://image.tmdb.org/t/p/w342/en-top.jpg", info.posterUrl)
-        assertEquals(1, http.requests.size)
+    fun englishRanksTheGalleryAndUsesConfiguredSizes() = runBlocking {
+        http.on("search/movie") { bunnySearch }
+        http.on("movie/10378") {
+            """{"id":10378,"title":"Big Buck Bunny","poster_path":"/small.jpg","images":{"posters":[
+              {"file_path":"/small.jpg","iso_639_1":"en","width":150,"height":225,"vote_average":9.9,"vote_count":200},
+              {"file_path":"/english.jpg","iso_639_1":"en","width":1000,"height":1500,"vote_average":6.5,"vote_count":20},
+              {"file_path":"/wordless.jpg","width":900,"height":1350,"vote_average":8,"vote_count":30}
+            ],"backdrops":[{"file_path":"/wide.jpg","width":1600,"height":900}]}}"""
+        }
+        http.on("/configuration") {
+            """{"images":{"secure_base_url":"https://image.tmdb.org/t/p/","poster_sizes":["w342","w500","original"],"backdrop_sizes":["w300","w780","original"]}}"""
+        }
+        val info = (metadata().lookup(query("Big.Buck.Bunny.2008.mkv")) as MetaResult.Found).info
+        assertEquals("https://image.tmdb.org/t/p/w500/english.jpg", info.posterUrl)
+        assertEquals("https://image.tmdb.org/t/p/w780/wide.jpg", info.backdropUrl)
+        assertEquals(1, http.count("/configuration"))
+        assertEquals(1, http.count("append_to_response=images"))
+    }
+
+    private fun cloud(name: String, transfer: String, fileId: Long = 4, markers: String = "") =
+        com.tmplayer.torbox.TorBoxMedia(com.tmplayer.torbox.TorBoxFile(
+            torrentId = 12, fileId = fileId, name = name, size = 100, added = "", ready = true,
+            transferName = transfer, metadataMarkers = markers,
+        )).toMediaItem()
+
+    @Test
+    fun torBoxConsidersBothNamesAndKeepsTheMatchAfterARename() = runBlocking {
+        http.on("search/movie?query=Big+Buck+Bunny") { bunnySearch }
+        http.on("search/movie?query=An+Unrelated+Filename") { """{"results":[]}""" }
+        http.on("movie/10378") { """{"id":10378,"title":"Big Buck Bunny","release_date":"2008-04-10"}""" }
+        val item = cloud("An.Unrelated.Filename.2008.1080p.AV1.mkv", "Big.Buck.Bunny.2008.4K.DDP5.1-GRP")
+        val online = metadata()
+        val first = kotlinx.coroutines.coroutineScope {
+            val pending = List(2) { async { online.lookup(item.metaQuery!!) } }
+            pending.map { it.await() }
+        }
+        val info = (first[0] as MetaResult.Found).info
+        assertEquals(first[0], first[1])
+        assertEquals("10378", info.id)
+        assertEquals("2008-04-10", info.date)
+        assertNull(info.posterUrl)
+        assertEquals(1, http.count("search/movie?query=Big+Buck+Bunny"))
+        assertEquals(1, http.count("search/movie?query=An+Unrelated+Filename"))
+        val renamed = cloud("video.720p.mkv", "")
+        assertEquals(item.id, renamed.id)
+        val calls = http.requests.size
+        assertEquals(first[0], metadata(key = "").lookup(renamed.metaQuery!!))
+        assertEquals(calls, http.requests.size)
+        assertNotEquals(item.id, cloud(item.fileName, "", fileId = 5).id)
+    }
+
+    @Test
+    fun torBoxResolvesAnImdbShowAndUsesItsOwnTmdbEpisode() = runBlocking {
+        val item = cloud("S02E03.2160p.HEVC.Atmos.mkv", "Harbour.Notes.2021.S02.1080p", markers = "{imdb-tt1234567}")
+        val query = item.metaQuery!!
+        assertEquals("Harbour Notes", query.title)
+        assertEquals(2021, query.year)
+        assertEquals(2, query.season)
+        assertEquals(3, query.episode)
+        assertEquals("tt1234567", query.imdbId)
+        http.on("/find/tt1234567") { harbourSearch.replace("\"results\"", "\"tv_results\"") }
+        http.on("tv/555/season/2/episode/3") { harbourEpisode.dropLast(1) + ""","air_date":"2023-05-04","runtime":46}""" }
+        http.on("tv/555") { """{"id":555,"name":"Harbour Notes","first_air_date":"2021-03-01"}""" }
+        val online = metadata()
+        val info = (online.lookup(query) as MetaResult.Found).info
+        assertEquals(MetaKind.Show, info.kind)
+        assertEquals("Harbour Notes", info.title)
+        assertEquals("The Storm", info.episode?.name)
+        assertEquals("2023-05-04", info.episode?.airDate)
+        assertEquals(46, info.episode?.runtimeMin)
+        assertNull((online.lookup(query.showOnly()) as MetaResult.Found).info.episode)
+        assertEquals(0, http.count("tvmaze"))
+        assertEquals(0, http.count("search/"))
+        assertEquals(1, http.count("/find/tt1234567"))
+    }
+
+    @Test
+    fun torBoxDeclinesAnEqualMovieAndShowAndAcceptsAManualPick() = runBlocking {
+        http.on("search/movie") { bunnySearch }
+        http.on("search/tv") { bunnySearch.replace("\"title\"", "\"name\"").replace("\"release_date\"", "\"first_air_date\"").replace("10378", "7") }
+        http.on("movie/10378") { """{"id":10378,"title":"Big Buck Bunny"}""" }
+        val item = cloud("Big.Buck.Bunny.2008.480p.x265.AAC.mkv", "Big.Buck.Bunny.2008")
+        val query = item.metaQuery!!
+        val online = metadata()
+        assertEquals(MetaResult.NoMatch, online.lookup(query))
+        val correction = com.tmplayer.data.VideoCorrection(pick = com.tmplayer.data.PosterPick(
+            10378, posterUrl = "https://image.tmdb.org/t/p/w342/picked.jpg",
+        ), title = "My title")
+        val key = com.tmplayer.data.VideoCorrections.keyName(item)
+        assertEquals(item.id, com.tmplayer.data.VideoCorrections.idOf(key))
+        val pick = com.tmplayer.data.VideoCorrection.decode(correction.encode()).pick!!
+        assertEquals(correction.pick, pick)
+        val found = online.lookup(pick.forcing(query)) as MetaResult.Found
+        assertEquals("10378", found.info.id)
+    }
+
+    @Test
+    fun torBoxMatchesASeasonByTitleEvenWhenTheYearIsForTheSeason() = runBlocking {
+        val item = cloud("Harbour.Notes.S02E03.1080p.mkv", "Harbour.Notes.2023.S02.1080p")
+        http.on("search/tv") {
+            harbourSearch.replace(
+                """{"results":[""",
+                """{"results":[{"id":771,"name":"Harbor Notes","first_air_date":"2023-06-01"},""",
+            )
+        }
+        http.on("tv/555/season/2/episode/3") { harbourEpisode }
+        http.on("tv/555") { """{"id":555,"name":"Harbour Notes","first_air_date":"2021-03-01"}""" }
+        val info = (metadata().lookup(item.metaQuery!!) as MetaResult.Found).info
+        assertEquals("555", info.id)
+        assertEquals(2021, info.year)
+        assertEquals("The Storm", info.episode?.name)
+        assertEquals(0, http.count("search/movie"))
+    }
+
+    @Test
+    fun torBoxBacksOffAfterATemporaryFailure() = runBlocking {
+        http.on("search/movie", code = 503) { "{}" }
+        val query = cloud("Big.Buck.Bunny.2008.mkv", "").metaQuery!!
+        val online = metadata()
+        assertEquals(MetaResult.Unavailable, online.lookup(query))
+        assertEquals(2, http.count("search/movie"))
+        assertEquals(MetaResult.Unavailable, online.lookup(query))
+        assertEquals(2, http.count("search/movie"))
+        clock += 31_000
+        assertEquals(MetaResult.Unavailable, online.lookup(query))
+        assertEquals(4, http.count("search/movie"))
+    }
+
+    @Test
+    fun torBoxTypedTmdbLinkSkipsTextSearch() = runBlocking {
+        val item = cloud("Episode.S02E03.mkv", "Unknown", markers = "https://www.themoviedb.org/tv/555-harbour")
+        http.on("tv/555") { """{"id":555,"name":"Harbour Notes"}""" }
+        val query = item.metaQuery!!
+        assertEquals(555, query.tmdbId)
+        assertEquals(MetaKind.Show, query.explicitKind)
+        assertEquals("555", (metadata().lookup(query.showOnly()) as MetaResult.Found).info.id)
+        val renamedWithoutMarker = cloud("video.mkv", "").metaQuery!!
+        assertEquals("555", (metadata(key = "").lookup(renamedWithoutMarker) as MetaResult.Found).info.id)
+        assertEquals(0, http.count("search/"))
+        assertEquals(0, http.count("movie/"))
     }
 
     @Test
     fun aMissKeptBeforeTheEnglishSearchIsAskedAgain() {
         val q = query("Amelie.2001.mkv")
-        assertEquals("Film-v2|amelie|2001||||en-US", q.cacheKey("en-US"))
-        assertEquals("Film-v2|amelie|2001||||ar+en", q.cacheKey("ar"))
+        assertEquals("Film-v3|amelie|2001||||en-US", q.cacheKey("en-US"))
+        assertEquals("Film-v3|amelie|2001||||ar+en", q.cacheKey("ar"))
     }
 
     @Test
@@ -555,9 +691,9 @@ class OnlineMetadataTest {
         val tamil = MetaQuery(title = "Idiot", year = 2022, languages = listOf("ta"))
         val hindi = tamil.copy(languages = listOf("hi"))
         val none = tamil.copy(languages = emptyList())
-        assertEquals("Film-v2|idiot|2022||||en-US|ta", tamil.cacheKey("en-US"))
-        assertEquals("Film-v2|idiot|2022||||ar+en|hi", hindi.cacheKey("ar"))
-        assertEquals("Film-v2|idiot|2022||||en-US", none.cacheKey("en-US"))
+        assertEquals("Film-v3|idiot|2022||||en-US|ta", tamil.cacheKey("en-US"))
+        assertEquals("Film-v3|idiot|2022||||ar+en|hi", hindi.cacheKey("ar"))
+        assertEquals("Film-v3|idiot|2022||||en-US", none.cacheKey("en-US"))
         assertNotEquals(tamil.cacheKey("en-US"), hindi.cacheKey("en-US"))
     }
 
@@ -565,7 +701,7 @@ class OnlineMetadataTest {
     fun audioLanguagesInAnyOrderShareOneKey() {
         val a = MetaQuery(title = "Idiot", year = 2022, languages = listOf("ta", "hi"))
         val b = a.copy(languages = listOf("hi", "ta"))
-        assertEquals("Film-v2|idiot|2022||||en-US|hi-ta", a.cacheKey("en-US"))
+        assertEquals("Film-v3|idiot|2022||||en-US|hi-ta", a.cacheKey("en-US"))
         assertEquals(a.cacheKey("en-US"), b.cacheKey("en-US"))
     }
 

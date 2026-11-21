@@ -48,6 +48,7 @@ data class VideoCorrection(
         if (separate) add(SEPARATE)
         if (wrongMatch) add(WRONG)
         pick?.let { add("$TMDB${if (it.show) SHOW else FILM}:${it.tmdbId}") }
+        pick?.posterUrl?.takeIf(::validPoster)?.let { add("poster=" + it) }
         title?.trim()?.takeIf { it.isNotEmpty() }?.let { add("$TITLE${it.replace('\n', ' ')}") }
     }.joinToString("\n")
 
@@ -60,6 +61,9 @@ data class VideoCorrection(
         private const val SHOW = "show"
         private val PICK = Regex("""tmdb=(film|show):(\d{1,9})""")
 
+        private fun validPoster(url: String): Boolean =
+            Regex("""https://image\.tmdb\.org/t/p/(?:w\d+|original)/[A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp)""").matches(url)
+
         fun decode(text: String?): VideoCorrection {
             if (text.isNullOrBlank()) return VideoCorrection()
             val lines = text.lines()
@@ -71,7 +75,9 @@ data class VideoCorrection(
                 pick = lines.firstNotNullOfOrNull { line ->
                     val found = PICK.matchEntire(line.trim()) ?: return@firstNotNullOfOrNull null
                     val id = found.groupValues[2].toIntOrNull()?.takeIf { it > 0 } ?: return@firstNotNullOfOrNull null
-                    PosterPick(id, show = found.groupValues[1] == SHOW)
+                    val poster = lines.firstOrNull { it.startsWith("poster=") }
+                        ?.removePrefix("poster=")?.takeIf(::validPoster)
+                    PosterPick(id, show = found.groupValues[1] == SHOW, posterUrl = poster)
                 },
             )
         }
@@ -79,7 +85,7 @@ data class VideoCorrection(
 }
 
 /** A TMDB title the viewer chose for a video: its id, and whether it is a show (else a film). */
-data class PosterPick(val tmdbId: Int, val show: Boolean = false) {
+data class PosterPick(val tmdbId: Int, val show: Boolean = false, val posterUrl: String? = null) {
     val kind: MetaKind get() = if (show) MetaKind.Show else MetaKind.Film
 
     /** The `{tmdb-123}` question this pick forces: the title and year of [base] kept where it has them. */
@@ -88,7 +94,8 @@ data class PosterPick(val tmdbId: Int, val show: Boolean = false) {
         // A film pick drops the episode code the file's name carried: a film has none.
         val season = if (show) query.season else null
         val episode = if (show) query.episode else null
-        return query.copy(season = season, episode = episode, tmdbId = tmdbId, kind = kind, anime = false)
+        return query.copy(season = season, episode = episode, tmdbId = tmdbId, kind = kind, anime = false,
+            imdbId = null, explicitKind = kind, manuallyChosen = true)
     }
 }
 
@@ -138,6 +145,15 @@ object VideoCorrections {
      * picked for it where they did ("Choose the right poster"); [base] otherwise. A pick holds
      * even for a file whose name asks nothing by itself.
      */
+    fun baseQuery(item: MediaItem, renamed: String?): MetaQuery? {
+        val base = item.metaQuery
+        if (renamed == null) return base
+        val rename = MetaQuery.of(renamed) ?: return base
+        if (base?.torBoxKey == null) return rename
+        return base.copy(title = rename.title, year = rename.year ?: base.year,
+            transferTitle = null, transferYear = null, correctionTitle = renamed)
+    }
+
     fun queryOf(item: MediaItem, base: MetaQuery? = item.metaQuery, all: Map<String, VideoCorrection> = current): MetaQuery? {
         val correction = all[item.id]
         val pick = correction?.pick ?: return base
@@ -182,10 +198,15 @@ object VideoCorrections {
     /** The stored name for [chatId] and [messageId]'s correction. */
     fun keyName(chatId: Long, messageId: Long): String = "$PREFIX${chatId}_$messageId"
 
+    fun keyName(item: MediaItem): String =
+        if (item.identity is MediaIdentity.TorBox) PREFIX + item.id else keyName(item.chatId, item.messageId)
+
     /** The [MediaItem.id] a stored name stands for, or null for a name that is not one. */
     fun idOf(name: String): String? {
         if (!name.startsWith(PREFIX)) return null
-        val parts = name.removePrefix(PREFIX).split('_')
+        val key = name.removePrefix(PREFIX)
+        if (key.startsWith("torbox:")) return (MediaIdentity.parse(key) as? MediaIdentity.TorBox)?.key?.takeIf { it == key }
+        val parts = key.split('_')
         if (parts.size != 2) return null
         val chat = parts[0].toLongOrNull() ?: return null
         val message = parts[1].toLongOrNull() ?: return null

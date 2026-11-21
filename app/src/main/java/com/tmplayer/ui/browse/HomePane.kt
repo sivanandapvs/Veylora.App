@@ -1088,8 +1088,8 @@ private fun ShelfTile(
             item = entry.item,
             watched = watch.point(entry.item),
             finished = watch.finished(entry.item),
-            onClick = { onPlay(entry.item, chatTitle(entry.item.chatId)) },
-            onLongClick = { onHold(entry.item, chatTitle(entry.item.chatId)) },
+            onClick = { onPlay(entry.item, sourceTitle(entry.item, chatTitle)) },
+            onLongClick = { onHold(entry.item, sourceTitle(entry.item, chatTitle)) },
             dense = touch,
             poster = poster,
             // Its first bytes asked for while the card is in focus or under the finger.
@@ -1113,6 +1113,9 @@ private fun ShelfTile(
         }
     }
 }
+
+private fun sourceTitle(item: MediaItem, chatTitle: (Long) -> String): String =
+    if (item.identity is com.tmplayer.data.MediaIdentity.TorBox) "TorBox" else chatTitle(item.chatId)
 
 /** One horizontal lazy row, padded to line up with the heading, remembering its tile for the D-pad. */
 @Composable

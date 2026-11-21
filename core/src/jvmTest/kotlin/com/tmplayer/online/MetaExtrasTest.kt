@@ -156,7 +156,7 @@ class MetaExtrasTest {
         assertEquals("official", extras.trailer?.key)
         assertEquals("vnd.youtube:official", extras.trailer?.appUri)
         assertEquals("https://www.youtube.com/watch?v=official", extras.trailer?.watchUrl)
-        assertEquals(listOf("1", "2"), extras.similar.map { it.id })
+        assertEquals(listOf("1", "2", "9"), extras.similar.map { it.id })
     }
 
     @Test

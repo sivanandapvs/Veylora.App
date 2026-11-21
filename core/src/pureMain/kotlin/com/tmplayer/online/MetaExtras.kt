@@ -92,11 +92,12 @@ data class MetaExtras(
     val scoresAt: Long = 0,
     /** OMDb itself answered (not only Wikidata), so the page has IMDb's score if OMDb has one. */
     val scoresFromOmdb: Boolean = false,
+    val voteCount: Int? = null,
 ) {
     val isEmpty: Boolean
         get() = genres.isEmpty() && runtimeMin == null && seasons == null && rating == null && certification == null &&
             directors.isEmpty() && creators.isEmpty() && cast.isEmpty() && trailer == null && similar.isEmpty() &&
-            seasonList.isEmpty() && nextEpisode == null && scores.isEmpty()
+            seasonList.isEmpty() && nextEpisode == null && scores.isEmpty() && imdbId == null && voteCount == null
 
     fun toJson(): JSONObject = JSONObject()
         .put("genres", JSONArray(genres))
@@ -125,6 +126,7 @@ data class MetaExtras(
         .put("scores", MetaScore.listToJson(scores))
         .put("scoresAsked", scoresAsked)
         .put("scoresAt", scoresAt)
+        .put("voteCount", voteCount ?: 0)
         .put("scoresFromOmdb", scoresFromOmdb)
 
     companion object {
@@ -163,6 +165,7 @@ data class MetaExtras(
                 malId = json.optString("mal").ifBlank { null },
                 scores = MetaScore.listFromJson(json.optJSONArray("scores")),
                 scoresAsked = json.optBoolean("scoresAsked"),
+                voteCount = json.optInt("voteCount").takeIf { it > 0 },
                 scoresAt = json.optLong("scoresAt"),
                 scoresFromOmdb = json.optBoolean("scoresFromOmdb"),
             )
@@ -303,7 +306,16 @@ object MetaRules {
     /** Smaller than this and a logo is soft at the carousel's size. */
     const val LOGO_MIN_WIDTH = 200
 
-    fun poster(posters: List<MetaPoster>, uiLanguage: String, original: String?): MetaPoster? {
+    fun poster(posters: List<MetaPoster>, uiLanguage: String, original: String?): MetaPoster? =
+        artwork(posters, uiLanguage, original, POSTER_ASPECT, POSTER_MIN_WIDTH, 500)
+
+    fun backdrop(backdrops: List<MetaPoster>, uiLanguage: String, original: String?): MetaPoster? =
+        artwork(backdrops, uiLanguage, original, 1.65..1.9, 640, 780)
+
+    private fun artwork(
+        posters: List<MetaPoster>, uiLanguage: String, original: String?,
+        aspect: ClosedFloatingPointRange<Double>, minimumWidth: Int, preferredWidth: Int,
+    ): MetaPoster? {
         val ui = uiLanguage.substringBefore('-').lowercase()
         val first = original?.substringBefore('-')?.lowercase()?.takeIf { it.isNotBlank() }
         fun tier(p: MetaPoster): Int? {
@@ -316,10 +328,11 @@ object MetaRules {
             }
         }
         return posters
-            .filter { it.path.startsWith("/") && it.aspect in POSTER_ASPECT && it.width >= POSTER_MIN_WIDTH }
+            .filter { TmdbApi.validImagePath(it.path) && it.aspect in aspect && it.width >= minimumWidth }
             .mapNotNull { p -> tier(p)?.let { it to p } }
             .sortedWith(
-                compareBy<Pair<Int, MetaPoster>> { it.first }
+                compareByDescending<Pair<Int, MetaPoster>> { it.second.width >= preferredWidth }
+                    .thenBy { it.first }
                     .thenByDescending { it.second.voteAverage }
                     .thenByDescending { it.second.voteCount }
                     .thenByDescending { it.second.width },

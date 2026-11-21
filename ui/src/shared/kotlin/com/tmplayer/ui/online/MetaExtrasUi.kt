@@ -614,8 +614,9 @@ fun MoreLikeThisRow(
     onOpen: ((MediaItem) -> Unit)?,
     modifier: Modifier = Modifier,
     contentPadding: PaddingValues = PaddingValues(0.dp),
+    remoteFallback: Boolean = false,
 ) {
-    if (onOpen == null || extras.similar.isEmpty()) return
+    if (extras.similar.isEmpty() || (onOpen == null && !remoteFallback)) return
     val online = OnlineMetadata.current ?: return
     val s = LocalStrings.current
     val tv = !isTouch()
@@ -628,6 +629,25 @@ fun MoreLikeThisRow(
     if (titles.isEmpty()) {
         // A place holder one pixel tall, so being scrolled to is what starts the work.
         if (!seen) Spacer(modifier.fillMaxWidth().height(1.dp).onceOnScreen(seen) { seen = true })
+        if (seen && remoteFallback) {
+            val related = extras.similar.filter {
+                it.provider == MetaProvider.Tmdb && it.id.toIntOrNull()?.let { id -> id > 0 } == true && it.title.isNotBlank()
+            }
+            if (related.isNotEmpty()) {
+                val uri = androidx.compose.ui.platform.LocalUriHandler.current
+                Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(s.metadataMoreLikeThis, style = MaterialTheme.typography.titleSmall, color = Tone.text)
+                    related.forEach { title ->
+                        val path = if (title.kind == com.tmplayer.online.MetaKind.Film) "movie/" else "tv/"
+                        Text(
+                            title.title,
+                            modifier = Modifier.clickable { runCatching { uri.openUri("https://www.themoviedb.org/" + path + title.id) } },
+                            color = Tone.text,
+                        )
+                    }
+                }
+            }
+        }
         return
     }
     val rowState = androidx.compose.foundation.lazy.rememberLazyListState()
@@ -666,7 +686,7 @@ fun MoreLikeThisRow(
             items(titles, key = { it.item.id }) { known ->
                 KnownPoster(
                     known,
-                    onClick = { onOpen(known.item) },
+                    onClick = { onOpen?.invoke(known.item) },
                     modifier = if (known.item.id == returnId) {
                         Modifier.focusRequester(returnFocus).bringIntoViewRequester(returnView)
                     } else {

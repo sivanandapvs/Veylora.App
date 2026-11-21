@@ -48,6 +48,7 @@ object WholeSeries {
         series: Series,
         fetch: suspend (chatId: Long, query: String, cursors: MediaCursors, topicId: Int) -> MediaPage? = ::telegram,
     ): Series {
+        if (series.cover.identity is com.tmplayer.data.MediaIdentity.TorBox) return series
         val query = SeriesFill.queryOf(series) ?: return series
         val chatId = series.cover.chatId
         val topic = series.cover.topicId

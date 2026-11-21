@@ -25,6 +25,8 @@ data class TorBoxFile(
     val added: String,
     val ready: Boolean,
     val source: TorBoxSource = TorBoxSource.Torrents,
+    val transferName: String = "",
+    val metadataMarkers: String = "",
 ) {
     val key: String get() = "${source.path}:$torrentId:$fileId"
 }
@@ -183,7 +185,22 @@ class TorBoxApi(private val http: HttpTransport) {
                     val fileId = file.optString("id").toLongOrNull()?.takeIf { it >= 0 } ?: continue
                     val name = file.opt("name") as? String ?: continue
                     if (name.length !in 1..4096 || name.substringAfterLast('.', "").lowercase() !in videoExtensions) continue
-                    files += TorBoxFile(id, fileId, name, file.optLong("size").coerceAtLeast(0), added, ready, source)
+                    fun markers(record: JSONObject): String = buildList {
+                        record.optString("tmdb_id").toIntOrNull()?.takeIf { it > 0 }?.let { tmdbId ->
+                            val type = when (record.optString("media_type").lowercase()) {
+                                "movie", "film" -> "movie-"
+                                "tv", "show", "series" -> "tv-"
+                                else -> ""
+                            }
+                            add("{tmdb-" + type + tmdbId + "}")
+                        }
+                        add(record.optString("imdb_id").take(32))
+                        add(record.optString("caption").take(4096))
+                    }.joinToString(" ")
+                    val metadata = listOf(file.optString("metadata_markers"), markers(file), markers(torrent))
+                        .joinToString(" ").trim().take(8192)
+                    files += TorBoxFile(id, fileId, name, file.optLong("size").coerceAtLeast(0), added, ready, source,
+                        torrent.optString("name").ifBlank { torrent.optString("original_name") }.take(4096), metadata)
                 }
             }
             val next = (offset + torrents.length()).takeIf { torrents.length() == PAGE_SIZE && it < MAX_TORRENTS }
@@ -197,10 +214,12 @@ class TorBoxApi(private val http: HttpTransport) {
             for ((id, files) in groups) {
                 val entries = JSONArray()
                 files.forEach { file ->
-                    entries.put(JSONObject().put("id", file.fileId).put("name", file.name).put("size", file.size))
+                    entries.put(JSONObject().put("id", file.fileId).put("name", file.name).put("size", file.size)
+                        .put("metadata_markers", file.metadataMarkers))
                 }
                 torrents.put(JSONObject().put("id", id).put("download_finished", files.all { it.ready })
-                    .put("created_at", files.firstOrNull()?.added.orEmpty()).put("files", entries))
+                    .put("created_at", files.firstOrNull()?.added.orEmpty())
+                    .put("name", files.firstOrNull()?.transferName.orEmpty()).put("files", entries))
             }
             return JSONObject().put("version", if (page.recordCount == 0 && groups.size <= PAGE_SIZE) 1 else 2)
                 .put("record_count", page.recordCount).put("owner", owner).put("source", source.name)

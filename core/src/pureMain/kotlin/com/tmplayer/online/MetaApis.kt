@@ -4,6 +4,8 @@ import com.tmplayer.json.JSONArray
 import com.tmplayer.json.JSONObject
 import com.tmplayer.platform.IOException
 import com.tmplayer.platform.formEncode
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /** A metadata provider's answer, sorted into what [OnlineMetadata] has to tell apart. */
 sealed interface MetaReply<out T> {
@@ -31,7 +33,10 @@ data class MetaCandidate(
     val format: String = "",
     /** TMDB's `original_language`, ISO 639-1: the language the title was made in. */
     val originalLanguage: String = "",
+    val date: String? = null,
 )
+
+data class TmdbArtwork(val candidate: MetaCandidate, val posters: List<MetaPoster>, val backdrops: List<MetaPoster>)
 
 private fun enc(text: String): String = formEncode(text)
 
@@ -92,15 +97,21 @@ class TmdbApi(
     suspend fun tv(key: String, id: String, language: String): MetaReply<MetaCandidate> =
         get(key, "tv/$id", "language=$language") { tvCandidate(it) }
 
+    suspend fun findByImdb(key: String, id: String): MetaReply<List<Pair<Boolean, MetaCandidate>>> =
+        get(key, "find/" + enc(id), "external_source=imdb_id") { json ->
+            objects(json.optJSONArray("movie_results")).map { true to movieCandidate(it) } +
+                objects(json.optJSONArray("tv_results")).map { false to tvCandidate(it) }
+        }
+
     /**
      * A film or show in [language] with its posters in [imageLanguages] appended (ISO 639-1
      * codes, `null` for posters with no words), for [MetaRules.poster] to choose from.
      */
-    suspend fun localized(key: String, film: Boolean, id: String, language: String, imageLanguages: List<String>): MetaReply<Pair<MetaCandidate, List<MetaPoster>>> =
+    suspend fun localized(key: String, film: Boolean, id: String, language: String, imageLanguages: List<String>): MetaReply<TmdbArtwork> =
         get(key, if (film) "movie/$id" else "tv/$id", "language=$language&append_to_response=images&include_image_language=${imageLanguages.joinToString(",")}") { json ->
             val candidate = if (film) movieCandidate(json) else tvCandidate(json)
-            val posters = objects(json.optJSONObject("images")?.optJSONArray("posters")).mapNotNull { p ->
-                val path = p.optString("file_path").takeIf { it.startsWith("/") } ?: return@mapNotNull null
+            fun gallery(name: String) = objects(json.optJSONObject("images")?.optJSONArray(name)).mapNotNull { p ->
+                val path = p.optString("file_path").takeIf { validImagePath(it) } ?: return@mapNotNull null
                 val width = p.optInt("width")
                 val height = p.optInt("height")
                 MetaPoster(
@@ -112,14 +123,14 @@ class TmdbApi(
                     voteCount = p.optInt("vote_count"),
                 )
             }
-            candidate to posters
+            TmdbArtwork(candidate, gallery("posters"), gallery("backdrops"))
         }
 
     /** A film's or show's title logos in [imageLanguages] (ISO 639-1, `null` for none), for [MetaRules.logo]. */
     suspend fun logos(key: String, film: Boolean, id: String, imageLanguages: List<String>): MetaReply<List<MetaPoster>> =
         get(key, if (film) "movie/$id/images" else "tv/$id/images", "include_image_language=${imageLanguages.joinToString(",")}") { json ->
             objects(json.optJSONArray("logos")).mapNotNull { p ->
-                val path = p.optString("file_path").takeIf { it.startsWith("/") } ?: return@mapNotNull null
+                val path = p.optString("file_path").takeIf { validImagePath(it) } ?: return@mapNotNull null
                 val width = p.optInt("width")
                 val height = p.optInt("height")
                 MetaPoster(
@@ -139,6 +150,34 @@ class TmdbApi(
     /** [poster]'s address at the size a tile draws. */
     fun posterUrl(poster: MetaPoster): String = "$IMAGES/$POSTER_SIZE${poster.path}"
 
+    private data class ImageConfiguration(val base: String, val posterSizes: List<String>, val backdropSizes: List<String>)
+
+    private val configurationLock = Mutex()
+    private var configuration: ImageConfiguration? = null
+
+    suspend fun rankedImageUrl(key: String, artwork: MetaPoster, poster: Boolean): String {
+        val config = configurationLock.withLock {
+            configuration ?: (get(key, "configuration", "") { json ->
+                val images = json.getJSONObject("images")
+                fun sizes(name: String): List<String> {
+                    val values = images.optJSONArray(name) ?: return emptyList()
+                    return (0 until values.length()).map { values.optString(it) }
+                }
+                val base = images.getString("secure_base_url").trimEnd('/')
+                require(base == IMAGES)
+                ImageConfiguration(base, sizes("poster_sizes"), sizes("backdrop_sizes"))
+            } as? MetaReply.Ok)?.value?.also { configuration = it }
+                ?: ImageConfiguration(IMAGES, listOf("w342", "w500"), listOf("w780"))
+                    .also { configuration = it }
+        }
+        val sizes = if (poster) config.posterSizes else config.backdropSizes
+        val target = if (poster) 500 else 780
+        val size = sizes.mapNotNull { it.takeIf { size -> size.startsWith("w") }?.drop(1)?.toIntOrNull() }
+            .filter { it in 1..minOf(target, artwork.width) }.maxOrNull()?.let { "w" + it }
+            ?: "original".takeIf { it in sizes } ?: if (poster) POSTER_SIZE else BACKDROP_SIZE
+        return config.base + "/" + size + artwork.path
+    }
+
     suspend fun episode(key: String, id: String, season: Int, number: Int, language: String): MetaReply<MetaEpisode> =
         get(key, "tv/$id/season/$season/episode/$number", "language=$language") { json ->
             MetaEpisode(
@@ -147,6 +186,8 @@ class TmdbApi(
                 name = json.optString("name"),
                 overview = json.optString("overview"),
                 stillUrl = image(json, "still_path", STILL_SIZE),
+                airDate = json.optString("air_date").ifBlank { null },
+                runtimeMin = json.optInt("runtime").takeIf { it > 0 },
             )
         }
 
@@ -231,7 +272,7 @@ class TmdbApi(
             val id = r.opt("id")?.toString()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             MetaRef(MetaProvider.Tmdb, if (film) MetaKind.Film else MetaKind.Show, id, r.optString(if (film) "title" else "name"))
         }
-        val similar = refs("recommendations").ifEmpty { refs("similar") }.take(MetaRules.SIMILAR_LIMIT)
+        val similar = (refs("recommendations") + refs("similar")).distinctBy { it.id }.take(MetaRules.SIMILAR_LIMIT)
         // Season 0 is TMDB's specials, which no release names as a season.
         val seasonList = if (film) {
             emptyList()
@@ -256,6 +297,7 @@ class TmdbApi(
             cast = cast,
             trailer = MetaRules.trailer(videos, language),
             similar = similar,
+            voteCount = json.optInt("vote_count").takeIf { it > 0 },
             seasonList = seasonList,
             nextEpisode = next,
             ended = !film && json.optString("status") in setOf("Ended", "Canceled"),
@@ -269,7 +311,9 @@ class TmdbApi(
     private suspend fun <T> get(key: String, path: String, params: String, read: (JSONObject) -> T): MetaReply<T> {
         limiter.acquire()
         val bearer = key.length > 40
-        val url = "$BASE/$path?$params" + if (bearer) "" else "&api_key=${enc(key)}"
+        val query = listOfNotNull(params.takeIf { it.isNotBlank() }, if (bearer) null else "api_key=" + enc(key))
+            .joinToString("&")
+        val url = "$BASE/$path" + if (query.isEmpty()) "" else "?" + query
         val headers = buildMap {
             put("Accept", "application/json")
             put("User-Agent", userAgent)
@@ -291,6 +335,7 @@ class TmdbApi(
         posterUrl = image(it, "poster_path", POSTER_SIZE),
         backdropUrl = image(it, "backdrop_path", BACKDROP_SIZE),
         originalLanguage = it.optString("original_language"),
+        date = it.optString("release_date", it.optString("first_air_date")).ifBlank { null },
     )
 
     private fun tvCandidate(it: JSONObject) = MetaCandidate(
@@ -301,12 +346,16 @@ class TmdbApi(
         posterUrl = image(it, "poster_path", POSTER_SIZE),
         backdropUrl = image(it, "backdrop_path", BACKDROP_SIZE),
         originalLanguage = it.optString("original_language"),
+        date = it.optString("release_date", it.optString("first_air_date")).ifBlank { null },
     )
 
     private fun image(json: JSONObject, field: String, size: String): String? =
-        json.optString(field).takeIf { it.startsWith("/") }?.let { "$IMAGES/$size$it" }
+        json.optString(field).takeIf { validImagePath(it) }?.let { "$IMAGES/$size$it" }
 
     companion object {
+        private val IMAGE_PATH = Regex("""/[A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp|svg)""", RegexOption.IGNORE_CASE)
+        internal fun validImagePath(path: String): Boolean = IMAGE_PATH.matches(path)
+
         const val BASE = "https://api.themoviedb.org/3"
         const val IMAGES = "https://image.tmdb.org/t/p"
 

@@ -114,7 +114,7 @@ class MetadataCache(
         val json = runCatching { JSONObject(file.readText()) }.getOrNull() ?: return null
         val info = json.optJSONObject("info")?.let { MetaInfo.fromJson(it) }
         val ttl = if (info != null) foundTtlMs else missTtlMs
-        if (now() - json.optLong("saved") > ttl) {
+        if (!(info != null && key.startsWith("TorBoxIdentity-v1|")) && now() - json.optLong("saved") > ttl) {
             file.delete()
             return null
         }
@@ -232,6 +232,7 @@ class MetadataCache(
     override fun prune() {
         answers.listFiles()?.forEach { f ->
             val json = runCatching { JSONObject(f.readText()) }.getOrNull()
+            if (json?.has("info") == true && json.optString("key").startsWith("TorBoxIdentity-v1|")) return@forEach
             val ttl = if (json?.has("info") == true) foundTtlMs else missTtlMs
             if (json == null || now() - json.optLong("saved") > ttl) f.delete()
         }

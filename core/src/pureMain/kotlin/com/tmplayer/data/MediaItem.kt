@@ -112,6 +112,9 @@ data class MediaItem(
     val startSec: Int = 0,
     /** Telegram's seek thumbnails for the video, a sprite and its map, or null. See [StoryboardMaps]. */
     val storyboard: StoryboardFiles? = null,
+    val torBoxName: ParsedName? = null,
+    val torBoxTransferName: String = "",
+    val torBoxMarkers: String = "",
 ) {
     /**
      * Which byte piece of a cut video this file is, read off its name ([SplitPieces.pieceOf]), or
@@ -304,7 +307,7 @@ data class MediaItem(
      * grouping, keying and naming all ask for it, and a chat's listing asks for every file.
      */
     val parsedName: ParsedName
-        get() = parsedNameRead ?: MediaName.parse(nameForParsing, caption).also { parsedNameRead = it }
+        get() = parsedNameRead ?: (torBoxName ?: MediaName.parse(nameForParsing, caption)).also { parsedNameRead = it }
 
     /**
      * The online lookup's question for this item, worked out once: Home's folding and search's
@@ -312,7 +315,12 @@ data class MediaItem(
      */
     val metaQuery: com.tmplayer.online.MetaQuery?
         get() = read(metaQueryRead) {
-            com.tmplayer.online.MetaQuery.of(nameForParsing, caption).also { metaQueryRead = it ?: NotFound }
+            val query = if (identity is MediaIdentity.TorBox) {
+                com.tmplayer.online.MetaQuery.forTorBox(this)
+            } else {
+                com.tmplayer.online.MetaQuery.of(nameForParsing, caption)
+            }
+            query.also { metaQueryRead = it ?: NotFound }
         }
 
     /** [MediaName.tileTitle] of the file's name, read once: search screens every item by it per letter. */
@@ -322,7 +330,7 @@ data class MediaItem(
     /** The same without the caption, for a caption the chat puts under every post. */
     val parsedNameAlone: ParsedName
         get() = parsedNameAloneRead
-            ?: (if (caption.isBlank()) parsedName else MediaName.parse(nameForParsing)).also { parsedNameAloneRead = it }
+            ?: (if (caption.isBlank() || torBoxName != null) parsedName else MediaName.parse(nameForParsing)).also { parsedNameAloneRead = it }
 
     /**
      * [SameTitle.filmKey] as it reads with no correction of the viewer's on this video, which is

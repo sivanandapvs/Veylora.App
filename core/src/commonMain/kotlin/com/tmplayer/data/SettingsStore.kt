@@ -672,7 +672,7 @@ class SettingsStore(private val prefs: DataStore<Preferences>) : AllowedChatsSou
         val updated = items.distinctBy { it.id }.map { it to change(now[it.id] ?: VideoCorrection()) }
         prefs.edit { prefs ->
             for ((item, correction) in updated) {
-                val key = stringPreferencesKey(VideoCorrections.keyName(item.chatId, item.messageId))
+                val key = stringPreferencesKey(VideoCorrections.keyName(item))
                 if (correction.isEmpty) prefs.remove(key) else prefs[key] = correction.encode()
             }
         }
